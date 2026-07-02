@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <RootNamespace>StrideSkySystem</RootNamespace>
+    <AssemblyName>StrideSkySystem</AssemblyName>
+  </PropertyGroup>
+  <!-- Reusable library: the procedural sky shader + the ProceduralSky day/night component. -->
+  <ItemGroup>
+    <PackageReference Include="Stride.Engine" Version="4.4.0.2" />
+    <PackageReference Include="Stride.Core.Assets.CompilerApp" Version="4.4.0.2" IncludeAssets="build;buildTransitive" />
+  </ItemGroup>
+  <!--
+    Stride 4.4's Roslyn source generator can reject the classic-syntax sky shader. Remove it from
+    @(AdditionalFiles) before CoreCompile; it is still compiled by the asset pipeline at runtime,
+    and every parameter is bound by string name (no generated *Keys class).
+  -->
+  <Target Name="DisableSdslSourceGeneratorForSkyShader" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <AdditionalFiles Remove="Effects\SkyProcedural.sdsl" />
+    </ItemGroup>
+  </Target>
+</Project>

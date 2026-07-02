@@ -1,0 +1,327 @@
+// Procedural sky shader.
+//
+// Used as the Emissive ComputeColor on a large inverted sphere ("sky dome")
+// that follows the camera. Computes:
+//   - vertical color gradient (zenith → horizon)
+//   - sun disc + soft glow (driven by SunDirection)
+//   - procedural stars (hash on view direction, visible only at night)
+//
+// Day vs night blend is driven by NightFactor (0 = noon, 1 = midnight).
+// Driven from C# by SkyDomeComponent which writes those params each frame.
+
+shader SkyProcedural : ComputeColor, PositionStream4
+{
+    cbuffer PerMaterial
+    {
+        stage float3 SunDirection;
+        stage float3 MoonDirection;
+        stage float  NightFactor;
+        stage float3 ZenithDayColor;
+        stage float3 HorizonDayColor;
+        stage float3 ZenithNightColor;
+        stage float3 HorizonNightColor;
+        stage float3 SunColor;
+        stage float  StarBrightness;
+        // Cloud cover for the day, 0 = clear sky, 1 = fully overcast.
+        stage float  CloudCoverage;
+        // Per-day pattern offset so cloud shapes differ between days.
+        stage float  CloudSeed;
+        // World-space position of the dome center (= camera position). Used
+        // to compute the view direction reliably across drivers/GPUs: some
+        // GPUs deliver `streams.Position` at the pixel stage as world-space
+        // rather than local, producing the wrong direction. Computing
+        // `normalize(PositionWS - DomeCenter)` is robust.
+        stage float3 DomeCenter;
+    }
+
+    stage float Hash3(float3 p)
+    {
+        // Cheap deterministic noise — used for procedural starfield. Not the
+        // most beautiful distribution but the human eye can't tell once the
+        // stars are sparse + only visible at night.
+        p = frac(p * 0.3183099 + 0.1);
+        p *= 17.0;
+        return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+    }
+
+    stage float ValueNoise2D(float2 p)
+    {
+        float2 i = floor(p);
+        float2 f = frac(p);
+        float a = Hash3(float3(i, 0.0));
+        float b = Hash3(float3(i + float2(1.0, 0.0), 0.0));
+        float c = Hash3(float3(i + float2(0.0, 1.0), 0.0));
+        float d = Hash3(float3(i + float2(1.0, 1.0), 0.0));
+        float2 u = f * f * (3.0 - 2.0 * f);
+        return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+    }
+
+    // Single cloud layer: 3-octave fbm projected on a virtual sky plane.
+    // projScale controls visual feature size (larger = smaller cells on
+    // screen → distant cirrus; smaller = bigger cells → close cumulus).
+    // driftMul scales the wind speed (closer layers drift faster on
+    // screen → fakes parallax). threshOffset shifts the cutoff so layers
+    // turn on at different coverage levels. seedOff decorrelates layers.
+    //
+    // sunUv: direction toward the sun in cloud-plane uv space, scaled by
+    // a "shadow probe distance". When the sun is overhead, sunUv ≈ 0 and
+    // no shading is applied (realistic — overhead sun lights cloud tops
+    // uniformly). When the sun is low, sunUv has length, and we sample
+    // density both at the pixel and along sunUv to derive a self-shadow
+    // term: if there's denser cloud "between us and the sun" we sit in
+    // shadow. Returns density via the function value, lighting via `shade`.
+    // `time` passed in so this stage method doesn't reference the non-stage
+    // `Global.Time` built-in — keeps composition stage-only (no full import).
+    stage float CloudLayer(float3 viewDir, float invY, float projScale,
+                     float driftMul, float threshOffset, float seedOff,
+                     float2 sunUv, float time, out float shade)
+    {
+        float2 cuv = viewDir.xz * invY * projScale
+                   + float2(CloudSeed * 13.7 + seedOff,
+                            CloudSeed *  7.3 - seedOff * 0.5)
+                   + float2(time * 0.025 * driftMul,
+                            time * 0.017 * driftMul);
+
+        // Center sample: full 3-octave fbm for crisp shape.
+        float n0 = ValueNoise2D(cuv * 1.0) * 0.55;
+              n0 += ValueNoise2D(cuv * 2.3 + 11.0) * 0.30;
+              n0 += ValueNoise2D(cuv * 5.1 + 23.0) * 0.15;
+
+        // Two cheap probes along sun direction for self-shadowing.
+        // 1-octave each (the high frequencies don't matter for the shadow
+        // gradient — only bulk density does). Different distances give a
+        // soft 2-tap "ray" through the cloud volume in 2D.
+        float2 cuv1 = cuv + sunUv * 0.55;
+        float2 cuv2 = cuv + sunUv * 1.30;
+        float n1 = ValueNoise2D(cuv1 * 1.4) * 0.65 + ValueNoise2D(cuv1 * 3.0 + 7.0) * 0.35;
+        float n2 = ValueNoise2D(cuv2 * 1.4) * 0.65 + ValueNoise2D(cuv2 * 3.0 + 7.0) * 0.35;
+
+        float thresh = lerp(0.80, 0.34, saturate(CloudCoverage)) + threshOffset;
+        float density = smoothstep(thresh, thresh + 0.18, n0);
+
+        // Self-shadow: how much denser cloud sits between this pixel and
+        // the sun. The further along the ray, the less it should
+        // contribute (light has more chance to reach us). 0..~1.
+        float occluded = saturate((n1 - thresh) * 2.5) * 0.55
+                       + saturate((n2 - thresh) * 2.5) * 0.30;
+
+        // Sun probe length tells us how "side-lit" the geometry is. Use
+        // it to scale the shading so overhead sun gives flat illumination
+        // and low sun gives strong chiaroscuro.
+        float sideLit = saturate(length(sunUv) * 1.3);
+
+        // Lit factor: 1.0 = fully lit (no occlusion), down to ~0.35 in
+        // self-shadow. A small "rim" boost when occlusion drops sharply
+        // gives the bright sun-facing edge of cumulus.
+        float litCore = 1.0 - occluded * 0.7 * sideLit;
+        float rim = saturate(0.30 - occluded) * sideLit * 0.55;
+        shade = saturate(litCore + rim);
+
+        return density;
+    }
+
+    override float4 Compute()
+    {
+        // The dome is a unit-radius sphere scaled and centered on the camera.
+        // View direction = vertex world position - dome center (= camera),
+        // normalized. Robust across drivers: streams.Position at the pixel
+        // stage was unreliable (some GPUs delivered world-space, producing
+        // direction biased toward the world origin → visible "sphere" in
+        // the sky). PositionWS - DomeCenter always gives the local offset.
+        float3 view = normalize(streams.PositionWS - DomeCenter);
+
+        // Vertical band: clamp keeps below-horizon a solid horizon color.
+        float t = saturate(view.y);
+        float3 zenith  = lerp(ZenithDayColor,  ZenithNightColor,  NightFactor);
+        float3 horizon = lerp(HorizonDayColor, HorizonNightColor, NightFactor);
+        float3 sky = lerp(horizon, zenith, smoothstep(0.0, 0.55, t));
+
+        float3 sunDir = normalize(SunDirection);
+        float dayMask = 1.0 - NightFactor;
+
+        // ── Sunset/sunrise horizon glow ──
+        // When the sun is near the horizon (rising or setting), tint the lower
+        // sky toward the current SunColor — strongest in the sun's azimuth,
+        // falling off as we look away. This is what gives the warm orange/red
+        // band along the horizon when the sun is low. Reuses the dynamic
+        // SunColor so the glow matches the disc tint (yellow→orange→red).
+        float sunNearHorizon = 1.0 - smoothstep(0.0, 0.15, max(sunDir.y, 0.0));
+        float horizonBand    = 1.0 - smoothstep(0.0, 0.15, t);
+        float2 sAz = float2(sunDir.x, sunDir.z);
+        float2 vAz = float2(view.x, view.z);
+        float sLen = length(sAz);
+        float vLen = length(vAz);
+        float azAlign = (sLen > 0.001 && vLen > 0.001)
+            ? saturate(dot(sAz, vAz) / (sLen * vLen))
+            : 0.0;
+        float glowMask = horizonBand * sunNearHorizon
+                       * (0.08 + 0.92 * pow(azAlign, 2.5))
+                       * dayMask;
+        sky = lerp(sky, SunColor * 1.2, glowMask * 0.45);
+
+        // ── Anti-twilight band (Belt of Venus) ──
+        // Symmetric counterpart to the sunset glow: when the sun is near the
+        // horizon, the side of the sky OPPOSITE the sun gets a soft pink/violet
+        // band low on the horizon. Without this, ±180° azimuth reads as a flat
+        // gray gap. azAlign == -1 facing away from sun → use (1 - azAlign)/2.
+        float antiAz       = saturate((1.0 - azAlign) * 0.5);
+        float antiMask     = horizonBand * sunNearHorizon
+                           * pow(antiAz, 2.5)
+                           * dayMask;
+        float3 antiTwilightColor = float3(0.78, 0.55, 0.72); // dusty pink/violet
+        sky = lerp(sky, antiTwilightColor, antiMask * 0.25);
+
+        // ── Sun disc ──
+        // Smoothstep on the cosine angle gives a clean, well-defined edge with
+        // a single tunable disc radius. pow() approaches were either soft-edged
+        // or crispy aliased depending on exponent; smoothstep is sharp + smooth.
+        // sunDir + dayMask declared above for the horizon glow block.
+        float sunDot = dot(view, sunDir);
+        // discRadius: cos(angularRadius). cos(0.025rad) ≈ 0.99969 → ~1.4° disc
+        // (about 2× bigger than before). Soft edge band keeps the rim clean.
+        float sunDisc = smoothstep(0.99955, 0.99980, sunDot);
+        // Tight inner halo (corona) around the disc — falls off fast.
+        float sunCorona = pow(saturate(sunDot), 256.0) * 0.5;
+        // Wider atmospheric glow — much more subtle than before so the disc is
+        // clearly delimited instead of being lost in a big bright blob.
+        float sunGlow = pow(saturate(sunDot), 24.0) * 0.18;
+        // Wide altitude gate: keeps the sun visible well below the geometric
+        // horizon so a player on a mountain (looking down at a low horizon)
+        // can still see the sun when it dips slightly underneath. dayMask
+        // already prevents sun bleed-through at night, so this mask only
+        // exists to suppress the sun on the *opposite* side of the world
+        // during deep night → can be much wider than ±2° without artifacts.
+        float sunAltMask = smoothstep(-0.20, 0.05, sunDir.y);
+        // sunDisc multiplier kept moderate (2.0): high enough that the disc
+        // reads as a real bright sun against the blue sky, low enough that
+        // the post-process LensFlare/LightStreak produce a tasteful flare
+        // instead of a screen-wide halo. Was 6.0 — too hot once the dome
+        // properly tracks the camera (lens flare clamped to a few % of FOV).
+        sky += SunColor * (sunDisc * 2.0 + sunCorona + sunGlow) * dayMask * sunAltMask;
+
+        // ── Moon disc (only at night) ──
+        // Moon direction comes from C# independent of the sun (real 24h orbit
+        // shifted by 12h). Disc is slightly bigger than sun + cool tint, with
+        // surface texturing (maria + craters) for visible detail.
+        float3 moonDir = normalize(MoonDirection);
+        float moonDot = dot(view, moonDir);
+        // Moon angular radius ~1.2° → cos ≈ 0.99978
+        float moonDisc = smoothstep(0.99970, 0.99985, moonDot);
+        float moonHalo = pow(saturate(moonDot), 64.0) * 0.18;
+        float moonGlow = pow(saturate(moonDot), 8.0) * 0.04;
+
+        // Local moon-disc tangent frame so surface details stay glued to the
+        // moon as it moves across the sky (not anchored in world view space).
+        float3 moonRight = normalize(cross(float3(0.0, 1.0, 0.001), moonDir));
+        float3 moonUp = cross(moonDir, moonRight);
+        // u/v in tiny radians around moon direction. Multiply to bring features
+        // up to a useful frequency on the ~1.2° disc.
+        float u = dot(view - moonDir, moonRight) * 220.0;
+        float v = dot(view - moonDir, moonUp) * 220.0;
+
+        // Maria (large dark plains): low-freq hash threshold → broad dark blobs.
+        float mariaHash = Hash3(float3(floor(u * 1.4), floor(v * 1.4), 7.0));
+        float maria = smoothstep(0.45, 0.65, mariaHash) * 0.35;
+
+        // Craters: medium- and high-freq hash thresholds → small dark spots.
+        float c1 = Hash3(float3(floor(u * 6.0), floor(v * 6.0), 19.0));
+        float c2 = Hash3(float3(floor(u * 12.0), floor(v * 12.0), 41.0));
+        float craters = step(0.78, c1) * 0.45 + step(0.86, c2) * 0.30;
+
+        // Subtle gray mottling so the unmaria area isn't a flat gradient.
+        float mottle = Hash3(float3(floor(u * 22.0), floor(v * 22.0), 53.0));
+        float mottleMod = (mottle - 0.5) * 0.10;
+
+        float surfaceDarken = saturate(maria + craters - mottleMod);
+
+        // Phase shading: project view offset from moon center onto an axis
+        // along the sun's direction projected on the moon-tangent plane → lit
+        // side faces the sun, dark side faces away. Subtle (the moon never
+        // goes pitch-black in this game's mood).
+        float3 sunOnTangent = sunDir - moonDir * dot(sunDir, moonDir);
+        float sotLen = length(sunOnTangent);
+        float3 phaseAxis = sotLen > 0.001 ? sunOnTangent / sotLen : moonRight;
+        float phaseDot = dot(view - moonDir, phaseAxis) * 220.0;
+        float phaseShade = saturate(0.55 + 0.45 * phaseDot);
+
+        float3 moonColor = float3(0.92, 0.94, 1.05);  // cool white
+        float3 moonLitColor = moonColor * lerp(0.30, 1.0, phaseShade) * (1.0 - surfaceDarken);
+        // Wide altitude gate, same rationale as the sun: visible well below
+        // the geometric horizon for mountain-top views. NightFactor still
+        // enforces day/night phase visibility independently.
+        float moonAltMask = smoothstep(-0.20, 0.05, moonDir.y);
+        sky += moonLitColor * moonDisc * 4.5 * NightFactor * moonAltMask;
+        sky += moonColor * (moonHalo + moonGlow) * NightFactor * moonAltMask;
+
+        // ── Procedural clouds (3-layer parallax) ──
+        // Three independent layers fake atmospheric depth without true
+        // raymarching:
+        //   - High (cirrus): small features, slow drift, slightly brighter
+        //     and tinted toward the sky color → reads as "far".
+        //   - Mid  (main body): default white, baseline coverage.
+        //   - Low  (foreground cumulus): big features, fast drift, darker
+        //     underside → reads as "close, looking up at it".
+        // Composited back-to-front so closer layers occlude farther ones.
+        if (view.y > 0.05 && CloudCoverage > 0.02)
+        {
+            float invY = 1.0 / max(view.y, 0.05);
+            float horizonFade = smoothstep(0.02, 0.15, view.y);
+
+            // Sun direction in cloud-plane uv space, scaled by a probe
+            // distance. Length 0 when sun is overhead (no side-lighting),
+            // grows as the sun gets closer to the horizon.
+            float2 sunUv = float2(sunDir.x, sunDir.z) * 1.4;
+
+            // Per-layer densities + lit factors. Different probe scaling
+            // per layer so larger features cast longer self-shadows.
+            float sH, sM, sL;
+            float time = Global.Time;
+            float dHigh = CloudLayer(view, invY, 0.62, 0.40, +0.10, 17.0, sunUv * 0.6, time, sH);
+            float dMid  = CloudLayer(view, invY, 0.32, 0.95,  0.00, 37.0, sunUv * 1.0, time, sM);
+            float dLow  = CloudLayer(view, invY, 0.18, 1.70, -0.06, 53.0, sunUv * 1.5, time, sL);
+
+            dHigh *= horizonFade;
+            dMid  *= horizonFade;
+            dLow  *= horizonFade;
+
+            // Shared base color: white-ish day, dim blue-gray night, with
+            // sunset-glow tint when the sun is near the horizon.
+            float lowSun = 1.0 - smoothstep(0.0, 0.30, max(sunDir.y, 0.0));
+            float3 baseDay   = float3(1.05, 1.00, 0.96);
+            float3 baseNight = float3(0.20, 0.24, 0.32);
+            float3 cBase = lerp(baseDay, baseNight, NightFactor);
+            cBase = lerp(cBase, SunColor * 1.1, lowSun * dayMask * 0.45);
+
+            // Apply self-shadow shading per layer. Lit areas get the full
+            // sun-facing color; shadowed areas get a darker tone. When the
+            // sun is low, push the shadow tint toward a dusty mauve instead
+            // of a flat blue-gray so the anti-sun horizon doesn't read as
+            // a gray hole next to the warm sunset side.
+            float3 cShadowCool = cBase * float3(0.42, 0.46, 0.55);
+            float3 cShadowWarm = cBase * float3(0.62, 0.48, 0.58);
+            float3 cShadow     = lerp(cShadowCool, cShadowWarm, lowSun * dayMask);
+            float3 cHigh = lerp(cShadow, lerp(cBase * 1.05, sky, 0.18), sH);
+            float3 cMid  = lerp(cShadow, cBase,                          sM);
+            float3 cLow  = lerp(cShadow, cBase * 1.05,                   sL);
+
+            // Back-to-front: high (deepest) → mid → low (closest).
+            sky = lerp(sky, cHigh, dHigh * 0.85);
+            sky = lerp(sky, cMid,  dMid  * 0.95);
+            sky = lerp(sky, cLow,  dLow  * 0.97);
+        }
+
+        // Procedural stars: quantize the sky direction to a coarse grid, hash
+        // each cell, light it up if past a high threshold. Multiplied by
+        // NightFactor so they only appear at night. Suppressed near the moon
+        // so its halo doesn't fight a dense star field.
+        float3 starGrid = floor(view * 350.0);
+        float h = Hash3(starGrid);
+        float starMask = 1.0 - smoothstep(0.985, 0.999, moonDot);
+        float star = step(0.985, h) * NightFactor * StarBrightness * starMask;
+        // Twinkle: modulate by another hash + global time
+        float twinkle = 0.7 + 0.3 * sin(Global.Time * (2.0 + h * 4.0) + h * 6.28);
+        sky += star * twinkle;
+
+        return float4(sky, 1.0);
+    }
+};

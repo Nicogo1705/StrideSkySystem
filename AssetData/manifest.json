@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "com.nicogo.procedural-sky",
+  "name": "Stride Procedural Sky & Day/Night",
+  "authors": [{ "name": "Nicogo", "url": "https://github.com/Nicogo1705" }],
+  "description": "A fully procedural sky on a camera-following dome: zenith-to-horizon gradient, sun disc + halo, a textured moon with phases, drifting multi-layer clouds, twinkling stars and a sunset/anti-twilight glow. A built-in day/night clock rotates the sun and moon and drives a directional light. No textures or cubemaps.",
+  "category": "Shaders",
+  "tags": ["sky", "skybox", "day-night", "procedural", "clouds", "stars", "atmosphere", "sdsl"],
+  "license": "MIT",
+  "thumbnail": "thumbnail.png",
+  "media": ["media/sunset.png", "media/night.png"],
+  "dependencies": [],
+  "defaultImport": "local"
+}
