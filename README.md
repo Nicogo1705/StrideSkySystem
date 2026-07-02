@@ -6,8 +6,6 @@ a sun disc + halo, a textured moon with phases, drifting multi-layer clouds, twi
 stars and a sunset / anti-twilight (Belt of Venus) glow — plus a built-in day/night clock
 that rotates the sun and moon and drives your directional light.
 
-![screenshot](thumbnail.png)
-
 ## What's in the box
 
 | File | Role |
