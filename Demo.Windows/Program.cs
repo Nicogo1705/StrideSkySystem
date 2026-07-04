@@ -48,6 +48,8 @@ namespace Demo.Windows
                 camera.Remove(controller);
             }
 
+            game.Window.SetSize(new Int2(1920, 1080)); // capture the showcase in 1080p
+
             // (start hour, hours per second) per variant; time is driven manually so the cycle
             // starts exactly when the screen capture does (after the shader warmup).
             var (startHour, hoursPerSecond) = variant switch
