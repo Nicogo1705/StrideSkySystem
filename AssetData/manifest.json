@@ -8,7 +8,7 @@
   "tags": ["sky", "skybox", "day-night", "procedural", "clouds", "stars", "atmosphere", "sdsl"],
   "license": "MIT",
   "thumbnail": "thumbnail.png",
-  "media": ["media/sunset.png", "media/night.png"],
+  "media": ["media/sunset-to-night.mp4", "media/night-to-sunrise.mp4", "media/timelapse-day.mp4", "media/sunset.png", "media/night.png"],
   "dependencies": [],
   "defaultImport": "local"
 }
