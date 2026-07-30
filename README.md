@@ -1,4 +1,5 @@
 # Stride Procedural Sky & Day/Night
+[![Available on the Community Stride Asset Store](https://img.shields.io/badge/Community_Stride_Asset_Store-install-5b8def)](https://nicogo1705.github.io/AssetStore/a/com.nicogo.procedural-sky)
 
 A fully procedural sky for [Stride](https://www.stride3d.net/) — no textures, no cubemaps.
 Attach one component and get a camera-following sky dome with a zenith→horizon gradient,
